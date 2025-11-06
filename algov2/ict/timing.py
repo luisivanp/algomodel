@@ -1,63 +1,34 @@
 # algov2/ict/timing.py
 from __future__ import annotations
-
-from typing import Dict, Iterable, Tuple, Optional
 import pandas as pd
 
-
-def session_mask(
-    idx: pd.DatetimeIndex,
-    windows: Dict[str, Tuple[str, str]],
-    allow: Iterable[str],
-) -> pd.Series:
-    """Boolean mask True when index time is inside any allowed session window."""
-    allow_set = set(a.upper() for a in allow)
-    out = pd.Series(False, index=idx)
-    if not windows:
-        return pd.Series(True, index=idx)
-
-    for name, (start_s, end_s) in windows.items():
-        if name.upper() not in allow_set:
-            continue
-        st = pd.to_datetime(start_s).time()
-        en = pd.to_datetime(end_s).time()
-        t = idx.time
-        if st <= en:
-            m = (t >= st) & (t <= en)
-        else:  # overnight
-            m = (t >= st) | (t <= en)
-        out = out | pd.Series(m, index=idx)
-    return out
-
-
-def lunch_block_mask(
-    idx: pd.DatetimeIndex,
-    enabled: bool = True,
-    start: str = "12:00",
-    end: str = "13:00",
-) -> pd.Series:
-    """True when NOT in lunch (if enabled)."""
-    if not enabled:
-        return pd.Series(True, index=idx)
-    st = pd.to_datetime(start).time()
-    en = pd.to_datetime(end).time()
-    t = idx.time
-    if st <= en:
-        allow = ~((t >= st) & (t <= en))
-    else:
-        allow = ~((t >= st) | (t <= en))
-    return pd.Series(allow, index=idx)
-
-
 def timing_gate(
-    idx: pd.DatetimeIndex,
-    windows: Dict[str, Tuple[str, str]],
-    allow: Iterable[str],
-    block_lunch: bool = True,
-    lunch_start: str = "12:00",
-    lunch_end: str = "13:00",
-) -> pd.Series:
-    """Combined allowed-time mask: sessions AND (not-lunch if enabled)."""
-    m_sess = session_mask(idx, windows, allow)
-    m_lunch = lunch_block_mask(idx, block_lunch, lunch_start, lunch_end)
-    return (m_sess & m_lunch).astype(bool)
+    df: pd.DataFrame,
+    cfg,
+    tz: str,
+    allow_sessions: tuple[str, ...] | None = None,
+    windows: dict[str, tuple[str, str]] | None = None,
+) -> pd.DataFrame:
+    """
+    Sets df['time_ok'] True if row falls in any allowed session.
+    If session flags are missing, defaults to True (no gate).
+    """
+    out = df.copy()
+    if allow_sessions is None:
+        allow_sessions = tuple(windows.keys()) if windows else ()
+
+    flags = []
+    for name in allow_sessions:
+        col = f"in_{name}"
+        if col in out.columns:
+            flags.append(out[col].astype(bool))
+
+    if flags:
+        ok = flags[0].copy()
+        for s in flags[1:]:
+            ok |= s
+    else:
+        ok = pd.Series(True, index=out.index)
+
+    out["time_ok"] = ok
+    return out
