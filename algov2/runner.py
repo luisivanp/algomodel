@@ -2,420 +2,212 @@
 from __future__ import annotations
 
 import os
-import re
-import inspect
+import sys
 from pathlib import Path
-from typing import Optional, Iterable, Set
+from typing import Tuple
 
-import numpy as np
 import pandas as pd
 import backtrader as bt
 
-from .config import get_config
-from .data.prep import prepare_market_df
+# ---- Local imports (lazy where helpful to avoid cycles) ----
+from .config import get_config, Config
+from .exec.bt_strategy import SignalData, SignalExecutor  # feed + strategy
 
 
-# -----------------------------
-# Robust datetime index helper
-# -----------------------------
-def ensure_dt_index(df: pd.DataFrame, tz: str) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        raise ValueError("ensure_dt_index: empty DataFrame")
+# ----------------- Helpers -----------------
 
+def ensure_tz_naive(df: pd.DataFrame) -> pd.DataFrame:
+    """Make index tz-naive (Excel-safe). Assumes index is datetime-like or convertible."""
+    if not isinstance(df.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+        # try to coerce
+        idx = pd.to_datetime(df.index, utc=True, errors='coerce')
+        df = df.copy()
+        df.index = idx
+    # now tz-normalize -> naive
     if isinstance(df.index, pd.DatetimeIndex):
-        idx = df.index
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+        else:
+            # already naive; keep as-is
+            pass
     elif isinstance(df.index, pd.PeriodIndex):
-        idx = df.index.to_timestamp()
-    else:
-        # detect a datetime-like column
-        import re as _re
-        col_candidates = [c for c in df.columns if _re.search(r"(datetime|timestamp|^ts$|date|time)", str(c), _re.I)]
-        preferred = ["datetime", "timestamp", "ts", "date", "time"]
-
-        ordered: list = []
-        for p in preferred:
-            for c in col_candidates:
-                if str(c).lower() == p:
-                    ordered.append(c)
-        for c in col_candidates:
-            if c not in ordered:
-                ordered.append(c)
-
-        found_idx = None
-        used_col = None
-        for c in ordered:
-            try:
-                ser = pd.to_datetime(df[c], errors="coerce", utc=True)
-                if ser.notna().any():
-                    found_idx = pd.DatetimeIndex(ser)
-                    used_col = c
-                    break
-            except Exception:
-                continue
-
-        if found_idx is None:
-            # last resort: parse index
-            try:
-                parsed = pd.to_datetime(df.index, errors="raise", utc=True)
-                found_idx = pd.DatetimeIndex(parsed)
-            except Exception as e:
-                sample_cols = list(map(str, df.columns[:10]))
-                raise TypeError(
-                    f"ensure_dt_index: could not find/parse a datetime column or index. "
-                    f"Columns sample={sample_cols}"
-                ) from e
-
-        idx = found_idx
-
-    if getattr(idx, "tz", None) is None:
-        idx = idx.tz_localize("UTC")
-    idx = idx.tz_convert(tz)
-
-    out = df.copy()
-    out.index = idx
-
-    try:
-        if 'used_col' in locals() and used_col in out.columns:
-            out = out.drop(columns=[used_col])
-    except Exception:
-        pass
-
-    out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out
+        # convert to timestamp then drop tz
+        df.index = df.index.to_timestamp().tz_localize(None)
+    # name it consistently for Backtrader/Excel niceness
+    if df.index.name is None:
+        df.index.name = "Datetime"
+    return df
 
 
-def sanitize_symbol(symbol: str) -> str:
-    return re.sub(r"\W+", "", symbol).upper()
-
-
-def export_to_excel(report_dir: str,
-                    symbol: str,
-                    start: str,
-                    end: str,
-                    trades_df: Optional[pd.DataFrame],
-                    tx_df: Optional[pd.DataFrame]) -> str:
+def export_to_excel(report_dir: str, symbol_tag: str, start: str, end: str,
+                    market_df: pd.DataFrame, signals_df: pd.DataFrame) -> str:
+    """Write two sheets: prices & signals, with tz-naive indices."""
     Path(report_dir).mkdir(parents=True, exist_ok=True)
-    sym = sanitize_symbol(symbol)
-    xls_path = os.path.join(report_dir, f"trades_{sym}_{start}_{end}.xlsx")
-
-    with pd.ExcelWriter(xls_path, engine="openpyxl") as xw:
-        if trades_df is not None and len(trades_df):
-            trades_df.to_excel(xw, sheet_name="trades", index=False)
-        else:
-            pd.DataFrame({"notice": ["no trades"]}).to_excel(xw, sheet_name="trades", index=False)
-
-        if tx_df is not None and len(tx_df):
-            tx_df.to_excel(xw, sheet_name="transactions", index=False)
-        else:
-            pd.DataFrame({"notice": ["no transactions"]}).to_excel(xw, sheet_name="transactions", index=False)
-
-    return xls_path
-
-
-# -----------------------------
-# Fallback minimal strategy
-# -----------------------------
-class MinimalSignalStrategy(bt.Strategy):
-    params = dict(
-        entry=None,       # np.ndarray
-        sig_long=None,    # np.ndarray
-        sig_short=None,   # np.ndarray
-        sl=None,          # np.ndarray
-        tp=None,          # np.ndarray
-        size=1,
+    outfile = os.path.join(
+        report_dir,
+        f"trades_{symbol_tag}_{start.replace('-','')}_{end.replace('-','')}.xlsx"
     )
 
-    def __init__(self):
-        self.trades_log = []
-        self.tx_log = []
+    # select standard OHLCV if present
+    price_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in market_df.columns]
+    md = ensure_tz_naive(market_df[price_cols].copy()) if price_cols else ensure_tz_naive(market_df.copy())
+    sg = ensure_tz_naive(signals_df.copy()) if not signals_df.empty else pd.DataFrame()
 
-    def notify_order(self, order):
-        if order.status in [order.Completed]:
-            otype = "BUY" if order.isbuy() else "SELL"
-            dt = bt.num2date(order.executed.dt)
-            self.tx_log.append(dict(
-                datetime=dt,
-                type=otype,
-                price=order.executed.price,
-                size=order.executed.size,
-                value=order.executed.value,
-                comm=order.executed.comm,
-            ))
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            try:
-                dt = bt.num2date(order.created.dt)
-            except Exception:
-                dt = None
-            self.tx_log.append(dict(
-                datetime=dt,
-                type="CANCELLED",
-                price=float(getattr(getattr(order, "created", object()), "price", np.nan) or np.nan),
-                size=getattr(getattr(order, "created", object()), "size", np.nan),
-                value=np.nan,
-                comm=np.nan,
-            ))
+    with pd.ExcelWriter(outfile, engine="openpyxl") as xw:
+        md.to_excel(xw, sheet_name="prices")
+        if not sg.empty:
+            sg.to_excel(xw, sheet_name="signals")
 
-    def notify_trade(self, trade):
-        if not trade.isclosed:
-            return
-        dtopen = bt.num2date(trade.dtopen)
-        dtclose = bt.num2date(trade.dtclose)
-        self.trades_log.append(dict(
-            open_datetime=dtopen,
-            close_datetime=dtclose,
-            size=trade.size,
-            price_open=trade.price,
-            price_close=trade.price,
-            pnl=trade.pnl,
-            pnlcomm=trade.pnlcomm,
-        ))
-
-    def next(self):
-        i = len(self.data) - 1
-        try:
-            entry = int(self.p.entry[i]) if self.p.entry is not None else 0
-            go_long = int(self.p.sig_long[i]) if self.p.sig_long is not None else 0
-            go_short = int(self.p.sig_short[i]) if self.p.sig_short is not None else 0
-            sl = float(self.p.sl[i]) if self.p.sl is not None else np.nan
-            tp = float(self.p.tp[i]) if self.p.tp is not None else np.nan
-        except Exception:
-            return
-
-        if not entry or (go_long == go_short):
-            return
-        if self.position:
-            return
-
-        size = int(self.p.size) if self.p.size else 1
-
-        if go_long == 1:
-            parent = self.buy(exectype=bt.Order.Market, size=size)
-            if np.isfinite(sl):
-                self.sell(exectype=bt.Order.Stop, price=sl, size=size, parent=parent)
-            if np.isfinite(tp):
-                self.sell(exectype=bt.Order.Limit, price=tp, size=size, parent=parent)
-        elif go_short == 1:
-            parent = self.sell(exectype=bt.Order.Market, size=size)
-            if np.isfinite(sl):
-                self.buy(exectype=bt.Order.Stop, price=sl, size=size, parent=parent)
-            if np.isfinite(tp):
-                self.buy(exectype=bt.Order.Limit, price=tp, size=size, parent=parent)
+    return outfile
 
 
-# -----------------------------
-# Strategy param introspection
-# -----------------------------
-def bt_param_names(cls) -> Set[str]:
+def _safe_numeric(s: pd.Series, fallback: float | int = 0) -> pd.Series:
+    """Coerce to numeric; replace non-numeric with fallback."""
+    return pd.to_numeric(s, errors="coerce").fillna(fallback)
+
+
+def merge_price_and_signals(market_df: pd.DataFrame, signals_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Extract backtrader Strategy params names as strings.
-    Supports tuple/list of tuples and dict forms.
+    Outer-join prices and signals on the index, and keep the columns Backtrader needs.
+    Backtrader requires: open, high, low, close, volume (lowercase).
+    Strategy feed uses: entry, dir, sl, tp
     """
-    names: Set[str] = set()
-    ps = getattr(cls, 'params', ())
-    if isinstance(ps, dict):
-        names = set(map(str, ps.keys()))
-    else:
-        # ps can be a tuple/list like: (('param', default), 'param2', ...)
-        for p in ps if isinstance(ps, Iterable) else ():
-            if isinstance(p, tuple) and p:
-                names.add(str(p[0]))
-            else:
-                names.add(str(p))
-    # backtrader also collects params from bases; try to read _getparams if present
+    df = market_df.copy()
+    if not signals_df.empty:
+        df = df.join(signals_df[["entry", "dir", "sl", "tp"]], how="left")
+
+    # Ensure mandatory columns exist
+    for col in ["entry", "dir", "sl", "tp"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # Clean dtypes for the four signal columns
+    df["entry"] = _safe_numeric(df["entry"], 0).clip(lower=0, upper=1)
+    df["dir"]   = _safe_numeric(df["dir"], 0).apply(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0))
+    df["sl"]    = pd.to_numeric(df["sl"], errors="coerce")  # NaN allowed -> strategy falls back
+    df["tp"]    = pd.to_numeric(df["tp"], errors="coerce")  # NaN allowed -> strategy falls back
+
+    # Backtrader requires tz-naive index
+    df = ensure_tz_naive(df)
+
+    # A quick sanity: sort by index to ensure monotonic increasing time
+    df = df.sort_index()
+
+    return df
+
+
+def load_prices(cfg: Config) -> pd.DataFrame:
+    """Call the prep routine to fetch and prepare OHLCV over the requested range."""
     try:
-        for p in getattr(cls, '_getparams', lambda: [])():
-            names.add(str(p[0]))
-    except Exception:
-        pass
-    return names
-
-
-# -----------------------------
-# Signals
-# -----------------------------
-def build_signals_safe(cfg, market_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calls exec.pipeline.build_signals with `cfg` (dataclass). If the pipeline expects
-    a dict and tries cfg.copy(), we retry with cfg.asdict().
-    """
-    try:
-        from .exec.pipeline import build_signals  # (cfg, df) -> df_signals
-        try:
-            return build_signals(cfg, market_df)
-        except Exception as e1:
-            # Retry with asdict if available
-            try:
-                cfgd = cfg.asdict()
-                return build_signals(cfgd, market_df)
-            except Exception as e2:
-                print(f"[runner] pipeline/build_signals error: {e1}")
-                return pd.DataFrame(index=market_df.index, data={
-                    "entry": 0.0, "dir": 0.0, "sig_long": 0.0, "sig_short": 0.0, "sl": np.nan, "tp": np.nan
-                })
+        from .data.prep import prepare_market_df  # local import
     except Exception as e:
-        print(f"[runner] pipeline/build_signals error: {e}")
-        return pd.DataFrame(index=market_df.index, data={
-            "entry": 0.0, "dir": 0.0, "sig_long": 0.0, "sig_short": 0.0, "sl": np.nan, "tp": np.nan
-        })
+        print(f"[runner] fatal: could not import data.prep.prepare_market_df: {e}", file=sys.stderr)
+        raise
+
+    symbol = cfg.symbol
+    start  = cfg.start
+    end    = cfg.end
+    tf     = cfg.timeframe
+    tzloc  = cfg.tz
+
+    df = prepare_market_df(symbol, start, end, tf, tzloc)  # must return ohlcv with datetime index
+    if not all(c in df.columns for c in ["open", "high", "low", "close", "volume"]):
+        got = list(df.columns)
+        raise ValueError(f"Downloaded data missing columns: ['open','high','low','close','volume'] | got={got}")
+    return df
 
 
-# -----------------------------
-# Backtrader feed
-# -----------------------------
-class PandasOHLC(bt.feeds.PandasData):
-    params = (
-        ('datetime', None),
-        ('open', 'open'),
-        ('high', 'high'),
-        ('low', 'low'),
-        ('close', 'close'),
-        ('volume', 'volume'),
-        ('openinterest', -1),
-    )
+def build_pipeline_signals(market_df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Run exec.pipeline.build_signals(df, cfg) and return a signals-only DataFrame."""
+    try:
+        from .exec import pipeline as pipeline_mod  # prints its path for debug
+    except Exception as e:
+        print(f"[runner] fatal: cannot import exec.pipeline: {e}", file=sys.stderr)
+        return pd.DataFrame(columns=["entry", "dir", "sl", "tp"])
+
+    try:
+        signals_df = pipeline_mod.build_signals(market_df, cfg)
+    except Exception as e:
+        print(f"[runner] pipeline/build_signals error: {e}", file=sys.stderr)
+        return pd.DataFrame(columns=["entry", "dir", "sl", "tp"])
+
+    # Keep only the columns the executor expects
+    keep = [c for c in ["entry", "dir", "sl", "tp", "type", "signals", "time_ok", "cool_ok"] if c in signals_df.columns]
+    return signals_df[keep].copy() if keep else pd.DataFrame(columns=["entry", "dir", "sl", "tp"])
 
 
-# -----------------------------
-# Main
-# -----------------------------
-def run():
-    cfg = get_config()
-    sym = cfg.symbol
-    print(f"Downloading {cfg.timeframe} data from {cfg.start} to {cfg.end} for {sym}...")
-
-    # Filter kwargs to whatever prepare_market_df currently accepts
-    full_kwargs = dict(
-        symbol=cfg.symbol,
-        start=cfg.start,
-        end=cfg.end,
-        timeframe=cfg.timeframe,
-        tz_local=cfg.tz,
-        use_cache=getattr(cfg.io, "use_cache", True),
-        debug=getattr(cfg, "debug", False),
-    )
-    sig = inspect.signature(prepare_market_df)
-    filtered_kwargs = {k: v for k, v in full_kwargs.items() if k in sig.parameters}
-
-    # 1) Prepare OHLCV
-    market_df = prepare_market_df(**filtered_kwargs)
-    market_df = ensure_dt_index(market_df, cfg.tz)
-
-    market_df = market_df.rename(columns={c: str(c).lower() for c in market_df.columns})
-    needed = ["open", "high", "low", "close", "volume"]
-    missing = [c for c in needed if c not in market_df.columns]
-    if missing:
-        raise ValueError(f"Prepared data missing columns: {missing}")
-    market_df = market_df[needed].copy()
-
-    # 2) Signals (ICT pipeline)
-    df_sig = build_signals_safe(cfg, market_df)
-    present = list(df_sig.columns)
-    print(f"[runner] signal columns present: {present}")
-    nonzero = df_sig[(df_sig.get("entry", 0) > 0) &
-                     ((df_sig.get("sig_long", 0) > 0) | (df_sig.get("sig_short", 0) > 0))]
+def print_signal_snapshot(df: pd.DataFrame, max_rows: int = 10) -> None:
+    cols = [c for c in ["entry", "dir", "sl", "tp", "type", "signals", "time_ok", "cool_ok"] if c in df.columns]
+    if not cols:
+        print("[runner] (no signal columns to preview)")
+        return
+    nonzero = df.loc[df["entry"].fillna(0) > 0]
+    print(f"[runner] signal columns present: {cols}")
     print(f"[runner] found {len(nonzero)} signal rows")
     if len(nonzero) > 0:
-        try:
-            print(nonzero.head(10)[["entry", "dir", "sig_long", "sig_short", "sl", "tp"]])
-        except Exception:
-            pass
+        print(nonzero[cols].head(max_rows))
 
-    # Align signals to market index
-    align_cols = ["entry", "sig_long", "sig_short", "sl", "tp"]
-    for c in align_cols:
-        if c not in df_sig.columns:
-            df_sig[c] = 0.0 if c not in ("sl", "tp") else np.nan
-    df_sig = df_sig.reindex(market_df.index)
-    df_sig[["entry", "sig_long", "sig_short"]] = df_sig[["entry", "sig_long", "sig_short"]].fillna(0.0)
-    df_sig = df_sig[align_cols].copy()
 
-    # 3) Backtrader
-    cerebro = bt.Cerebro(stdstats=False)
-    cerebro.broker.setcash(cfg.broker.start_cash)
-    cerebro.broker.setcommission(commission=cfg.broker.commission_per_contract, percabs=True)
+# ----------------- Main execution -----------------
 
-    data = PandasOHLC(dataname=market_df)
-    cerebro.adddata(data)
+def run() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    cfg = get_config()  # your chosen best-defaults
 
-    used_fallback = False
-    try:
-        from .exec.bt_strategy import ICTStrategy  # your strategy (if present)
-        # Build kwargs only with params ICTStrategy actually supports
-        param_names = bt_param_names(ICTStrategy)
+    # 1) Load OHLCV
+    market_df = load_prices(cfg)
+    print(f"[runner] market bars: {len(market_df)} | first: {market_df.index.min()} | last: {market_df.index.max()}")
 
-        candidate = {
-            "signals_df": df_sig,
-            "entry": df_sig["entry"].to_numpy(),
-            "sig_long": df_sig["sig_long"].to_numpy(),
-            "sig_short": df_sig["sig_short"].to_numpy(),
-            "sl": df_sig["sl"].to_numpy(),
-            "tp": df_sig["tp"].to_numpy(),
-            "size": max(1, int(getattr(cfg.risk, "fixed_size", 1))),
-        }
-        kwargs = {k: v for k, v in candidate.items() if k in param_names}
+    # 2) Build signals via pipeline
+    signals_df = build_pipeline_signals(market_df, cfg)
+    print_signal_snapshot(signals_df)
 
-        if kwargs:
-            cerebro.addstrategy(ICTStrategy, **kwargs)
-        else:
-            # If we can't pass anything meaningful, fallback
-            used_fallback = True
-    except Exception:
-        used_fallback = True
-
-    if used_fallback:
-        cerebro.addstrategy(
-            MinimalSignalStrategy,
-            entry=df_sig["entry"].to_numpy(),
-            sig_long=df_sig["sig_long"].to_numpy(),
-            sig_short=df_sig["sig_short"].to_numpy(),
-            sl=df_sig["sl"].to_numpy(),
-            tp=df_sig["tp"].to_numpy(),
-            size=max(1, int(getattr(cfg.risk, "fixed_size", 1))),
-        )
-
-    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='ta')
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
-
-    print(f"Initial Portfolio Value: {cerebro.broker.getvalue():,.2f}")
-    results = cerebro.run()
-    strat = results[0]
-    final_value = cerebro.broker.getvalue()
-    print(f"Final Portfolio Value: {final_value:,.2f}")
-
-    # 4) Export logs (fallback strat)
-    trades_df, tx_df = None, None
-    if isinstance(strat, MinimalSignalStrategy):
-        trades_df = pd.DataFrame(strat.trades_log)
-        tx_df = pd.DataFrame(strat.tx_log)
-
-    xls_path = export_to_excel(
-        cfg.io.report_dir,
-        cfg.symbol,
-        cfg.start,
-        cfg.end,
-        trades_df,
-        tx_df
-    )
+    # 3) Export report (prices + raw signals)
+    symbol_tag = cfg.symbol.replace('=F', 'F').replace('=f', 'F').replace('^', '')
+    xls_path = export_to_excel(cfg.io.report_dir, symbol_tag, cfg.start, cfg.end, market_df, signals_df)
     print(f"Saved Excel report → {xls_path}")
 
-    # 5) Stats
-    ta = strat.analyzers.ta.get_analysis() if hasattr(strat, 'analyzers') else {}
-    dd = strat.analyzers.dd.get_analysis() if hasattr(strat, 'analyzers') else {}
+    # If there are no entries, still stop cleanly after export
+    if signals_df.empty or (signals_df["entry"].fillna(0).sum() == 0):
+        print("Initial Portfolio Value: {:.2f}".format(cfg.broker.start_cash))
+        print("Final Portfolio Value:   {:.2f}".format(cfg.broker.start_cash))
+        print("Trades 0 | Wins 0 | Losses 0 | WinRate 0.00%")
+        print("Max Drawdown: 0.00%")
+        return market_df, signals_df
 
-    total_trades = ta.get('total', {}).get('total', 0) if ta else (0 if trades_df is None else len(trades_df))
-    won = ta.get('won', {}).get('total', 0) if ta else np.nan
-    lost = ta.get('lost', {}).get('total', 0) if ta else np.nan
-    winrate = (won / total_trades * 100.0) if total_trades else 0.0
-    maxdd_pct = dd.get('max', {}).get('drawdown', 0.0) if dd else 0.0
+    # 4) Merge price + signals for Backtrader feed
+    df_bt = merge_price_and_signals(market_df, signals_df)
 
-    print(f"Trades {total_trades} | Wins {won} | Losses {lost} | WinRate {winrate:.2f}%")
-    print(f"Max Drawdown: {maxdd_pct:.2f}%")
+    # 5) Backtrader: set up engine
+    cerebro = bt.Cerebro()
+    cerebro.broker.setcash(cfg.broker.start_cash)
+    # commission per contract side (futures-like)
+    cerebro.broker.setcommission(commission=cfg.broker.commission_per_contract)
+
+    # Data feed (mapping done by SignalData params)
+    data_feed = SignalData(
+        dataname=df_bt,
+        timeframe=bt.TimeFrame.Minutes,
+        compression=int(cfg.timeframe.strip('m')) if cfg.timeframe.endswith('m') else 1,
+    )
+    cerebro.adddata(data_feed)
+
+    # Strategy (no kwargs—SignalExecutor reads signal lines from feed)
+    cerebro.addstrategy(SignalExecutor)
+
+    print("Initial Portfolio Value: {:.2f}".format(cerebro.broker.getvalue()))
+    results = cerebro.run()
+    final_value = cerebro.broker.getvalue()
+    print("Final Portfolio Value:   {:.2f}".format(final_value))
+
+    # 6) Done
+    return market_df, signals_df
 
 
 def main():
     try:
         run()
     except Exception as e:
-        print(f"[runner] fatal: {e}")
+        print(f"[runner] fatal: {e}", file=sys.stderr)
         raise
 
 

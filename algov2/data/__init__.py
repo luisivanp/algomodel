@@ -1,9 +1,10 @@
 # algov2/data/__init__.py
-from .loader_legacy import fetch_prices
-from .prep import prepare_market_df, attach_daily_levels
+"""
+Public surface for data utilities.
+We re-export only the functions runner/pipeline call directly.
+"""
+from __future__ import annotations
 
-__all__ = [
-    "fetch_prices",
-    "prepare_market_df",
-    "attach_daily_levels",
-]
+from .prep import prepare_market_df, attach_daily_levels  # lightweight re-exports
+
+__all__ = ["prepare_market_df", "attach_daily_levels"]
